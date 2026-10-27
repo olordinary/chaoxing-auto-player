@@ -1,0 +1,25 @@
+# 运行产物
+runs/
+*.log
+state.json
+_diag.txt
+
+# 本地配置（里面有你的课程参数）
+config.json
+
+# 浏览器登录态 —— 含 Cookie，绝对不要提交
+profile/
+.workbuddy/
+*.mp4
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# 系统
+.DS_Store
+Thumbs.db
+desktop.ini

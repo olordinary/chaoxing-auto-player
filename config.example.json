@@ -1,0 +1,14 @@
+{
+  "_说明": "把这个文件复制成 config.json 后按需修改；也可以直接运行 python chaoxing_player.py init 自动生成。",
+  "cdp_port": 9225,
+  "edge": "",
+  "profile_dir": "",
+  "output_dir": "",
+  "course": {
+    "courseId": "",
+    "clazzid": "",
+    "cpi": "",
+    "enc": "",
+    "entry_chapter": ""
+  }
+}
