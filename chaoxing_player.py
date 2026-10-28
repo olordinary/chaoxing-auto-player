@@ -1054,6 +1054,33 @@ def main():
     qd.set_defaults(func=cmd_quiz_entry, from_=None, to=None,
                      all=False, index=None, chapters=None, dry_run=False)
 
+    qa = qzsub.add_parser(
+        "auto",
+        help="一键：抓讲义 → 抓题 → 打包作答载荷 →（有答案时）出复习册",
+        description=("一键跑完一套测验的完整流程。\n"
+                     "注意与 `play --all` 的区别：\n"
+                     "  play --all  = 目录里全部播放节点（视频为主），逐个播放；\n"
+                     "  quiz auto --all = 只处理测验节点，抓讲义和题目，不播放任何视频。"),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    qa.add_argument("--chapter", dest="chapters", help="单章，如 5")
+    qa.add_argument("--chapters", help="多章，逗号分隔，如 5,6")
+    qa.add_argument("--from", dest="from_", help="起始编号，如 5")
+    qa.add_argument("--to", help="结束编号，如 6")
+    qa.add_argument("--all", action="store_true",
+                    help="处理全部测验（9 套）。不同于 play --all：这里不碰视频")
+    qa.add_argument("--index", nargs="+", type=int)
+    qa.add_argument("--docs-for", dest="docs_for",
+                    help="同章有多套测验时人工指定依据，如 5.5=5.1,5.2")
+    qa.add_argument("--dry-run", action="store_true", help="只打印关联计划，不抓取")
+    qa.add_argument("--force", action="store_true", help="忽略已有讲义与题目重抓")
+    qa.add_argument("--report-only", dest="report_only", action="store_true",
+                    help="跳过抓取，只用现有 questions.json + answers.json 重出报告")
+    qa.add_argument("--require-submitted", dest="require_submitted", action="store_true")
+    qa.add_argument("--no-require-submitted", dest="require_submitted", action="store_false")
+    qa.set_defaults(func=cmd_quiz_entry, require_submitted=None, from_=None, to=None,
+                     all=False, index=None, chapters=None, dry_run=False,
+                     force=False, report_only=False, docs_for=None)
+
     args = ap.parse_args()
     cfg = load_config()
     return args.func(cfg, args) or 0

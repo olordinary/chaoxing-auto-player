@@ -431,7 +431,7 @@ def build_report(quiz_data, answers, out_path, watermark, title, meta):
 
 
 def cmd_quiz(cfg, args, cp):
-    """quiz 子命令入口（list / fetch / report / docs）。"""
+    """quiz 子命令入口（list / fetch / report / docs / auto）。"""
     sub = args.quiz_cmd
     if sub == "list":
         return quiz_list(cfg, cp)
@@ -441,6 +441,8 @@ def cmd_quiz(cfg, args, cp):
         return quiz_report(cfg, args)
     if sub == "docs":
         return quiz_docs(cfg, args, cp)
+    if sub == "auto":
+        return quiz_auto(cfg, args, cp)
     return 1
 
 
@@ -500,6 +502,64 @@ def _norm_num(num, qcat):
     return num
 
 
+JS_CLICK_KID = r"""
+(kid) => {
+  const el = document.getElementById('cur'+kid) || document.getElementById(kid);
+  if (el) { (el.querySelector('.posCatalog_name') || el).click(); }
+}
+"""
+
+
+def fetch_one_quiz(page, cfg, chap, out_dir, policy_required):
+    """抓单套测验并写入 out_dir/questions.json。
+
+    fetch 与 auto 共用这一份实现，避免两处逻辑漂移。
+    返回状态 dict（status: ok / no_work / not_submitted）。
+    """
+    page.evaluate(JS_CLICK_KID, chap["kid"])
+    page.wait_for_timeout(7000)
+    wf = find_work_frame(page)
+    if wf is None:
+        print("   没有测验内容，跳过")
+        return {"status": "no_work"}
+
+    info = wf.evaluate(JS_QUESTIONS)
+    submitted = detect_submitted(info)
+    if policy_required and not submitted:
+        print("   未提交，按策略跳过（--no-require-submitted 可放开）")
+        return {"status": "not_submitted"}
+
+    html = grab_page_html(page, wf)
+    fonts = extract_embedded_fonts(html)
+    print(f"   内嵌字体 {len(fonts)} 个，题目 {len(info['questions'])} 道")
+    mapping, lows = {}, []
+    for fb in fonts:
+        m, low = build_mapping(fb)
+        mapping.update(m)
+        lows.extend(low)
+    if lows:
+        print(f"   ⚠ {len(lows)} 个字形置信度低，需人工核对："
+              + ", ".join(x["char"] for x in lows[:12]))
+
+    qs = [normalize_question(q, mapping) for q in info["questions"]]
+    data = {
+        "course": (cfg.get("course") or {}).get("name", ""),
+        "chapter": {"kid": chap["kid"], "num": chap["num"], "title": chap["title"]},
+        "work": {"submitted": submitted, "count": len(qs)},
+        "policy": {"require_submitted": policy_required,
+                   "fetched_at": datetime.now().isoformat(timespec="seconds")},
+        "low_confidence_glyphs": lows,
+        "sections": [decode(s, mapping) for s in info["sections"]],
+        "questions": qs,
+    }
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "questions.json").write_text(
+        json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    print(f"   已保存 {out_dir / 'questions.json'}（submitted={submitted}）")
+    return {"status": "ok", "count": len(qs), "submitted": submitted,
+            "low_glyphs": len(lows)}
+
+
 def quiz_fetch(cfg, args, cp):
     from playwright.sync_api import sync_playwright
     cp.ensure_browser(cfg)
@@ -536,55 +596,9 @@ def quiz_fetch(cfg, args, cp):
         records = []
         for chap in plan:
             print(f"\n→ {chap['num']} {chap['title']}")
-            page.evaluate("""(kid) => {
-                const el = document.getElementById('cur'+kid) || document.getElementById(kid);
-                if (el) { (el.querySelector('.posCatalog_name') || el).click(); }
-            }""", chap["kid"])
-            page.wait_for_timeout(7000)
-            wf = find_work_frame(page)
-            if wf is None:
-                print("   没有测验内容，跳过")
-                records.append({"kid": chap["kid"], "num": chap["num"], "status": "no_work"})
-                continue
-
-            info = wf.evaluate(JS_QUESTIONS)
-            submitted = detect_submitted(info)
-            if policy_required and not submitted:
-                print("   未提交，按策略跳过（--no-require-submitted 可放开）")
-                records.append({"kid": chap["kid"], "num": chap["num"], "status": "not_submitted"})
-                continue
-
-            html = grab_page_html(page, wf)
-            fonts = extract_embedded_fonts(html)
-            print(f"   内嵌字体 {len(fonts)} 个，题目 {len(info['questions'])} 道")
-            mapping = {}
-            lows = []
-            for fb in fonts:
-                m, low = build_mapping(fb)
-                mapping.update(m)
-                lows.extend(low)
-            if lows:
-                print(f"   ⚠ {len(lows)} 个字形置信度低，需人工核对："
-                      + ", ".join(x["char"] for x in lows[:12]))
-
-            qs = [normalize_question(q, mapping) for q in info["questions"]]
-            data = {
-                "course": (cfg.get("course") or {}).get("name", ""),
-                "chapter": {"kid": chap["kid"], "num": chap["num"], "title": chap["title"]},
-                "work": {"submitted": submitted, "count": len(qs)},
-                "policy": {"require_submitted": policy_required,
-                           "fetched_at": datetime.now().isoformat(timespec="seconds")},
-                "low_confidence_glyphs": lows,
-                "sections": [decode(s, mapping) for s in info["sections"]],
-                "questions": qs,
-            }
-            out = run_dir / chap["kid"]
-            out.mkdir(parents=True, exist_ok=True)
-            (out / "questions.json").write_text(json.dumps(data, ensure_ascii=False, indent=1),
-                                                encoding="utf-8")
-            print(f"   已保存 {out / 'questions.json'}（submitted={submitted}）")
-            records.append({"kid": chap["kid"], "num": chap["num"], "status": "ok",
-                            "count": len(qs), "submitted": submitted})
+            rec = fetch_one_quiz(page, cfg, chap, run_dir / chap["kid"], policy_required)
+            rec.update({"kid": chap["kid"], "num": chap["num"]})
+            records.append(rec)
         (run_dir / "manifest.json").write_text(json.dumps(records, ensure_ascii=False, indent=1),
                                                encoding="utf-8")
         print("\n产物:", run_dir)
@@ -594,23 +608,11 @@ def quiz_fetch(cfg, args, cp):
 def quiz_report(cfg, args):
     run_dir = Path(args.run_dir)
     made = 0
-    for qf in sorted(run_dir.glob("*/questions.json")):
-        d = json.loads(qf.read_text(encoding="utf-8"))
-        af = qf.parent / "answers.json"
-        if not af.exists():
-            print(f"跳过 {qf.parent.name}：缺少 answers.json")
-            continue
-        a = json.loads(af.read_text(encoding="utf-8"))
-        title = f"{d['chapter']['num']} {d['chapter']['title']}"
-        meta = (f"{d.get('course','')} · {len(d['questions'])} 题 · "
-                f"生成于 {d['policy']['fetched_at']} · "
-                f"策略 require_submitted={d['policy']['require_submitted']}")
-        wm = args.watermark or "参考答案 · 仅供预习与复习，考试以线下为准"
-        out = qf.parent / "参考答案.html"
-        build_report(d, a, out, wm, title, meta)
-        md = build_answer_key(d, a, qf.parent / "答案速查.md", title)
-        print("已生成", out, "和", md.name)
-        made += 1
+    for qf in sorted(run_dir.glob("**/questions.json")):
+        if report_one(qf, getattr(args, "watermark", None)):
+            made += 1
+    if not made:
+        print("没有生成任何报告（检查 answers.json 是否存在）")
     return 0 if made else 1
 
 
@@ -727,4 +729,376 @@ def quiz_docs(cfg, args, cp):
         have = sum(1 for v in index.values() if v["pages"])
         print(f"完成：{have}/{len(index)} 节有讲义，共 "
               f"{sum(v['pages'] for v in index.values())} 页 -> {DOC_CACHE}")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# 一键流水线：scan → docs → fetch → pack → report
+# --------------------------------------------------------------------------- #
+def chapter_key(num):
+    """'5' -> 'ch05'，保证目录排序稳定。"""
+    try:
+        return f"ch{int(str(num).split('.')[0]):02d}"
+    except Exception:
+        return f"ch_{num}"
+
+
+def scan_chapters(cat):
+    """把目录按章分组：{章号: {num,title,kid,nodes:[...]}}"""
+    out, cur = {}, None
+    for c in cat:
+        if c.get("level") == 1:
+            cur = str(c["num"]).strip()
+            out[cur] = {"num": cur, "title": c["name"], "kid": c.get("kid"), "nodes": []}
+        elif cur is not None:
+            out[cur]["nodes"].append(c)
+    return out
+
+
+def _minor(num):
+    """取小节序号：'5.4' -> 4.0；取不到给一个大数（排到最后）。"""
+    try:
+        return float(str(num).split(".")[1])
+    except Exception:
+        return 999.0
+
+
+def link_quiz_docs(chapter):
+    """推断「测验 N.M 的依据 = 同章下编号小于 M 的非测验节点」。"""
+    quizzes = [n for n in chapter["nodes"] if QUIZ_NAME_RE.search(n["name"])]
+    lessons = [n for n in chapter["nodes"] if not QUIZ_NAME_RE.search(n["name"])]
+    pairs = []
+    for q in quizzes:
+        qm = _minor(q["num"])
+        deps = [l for l in lessons if _minor(l["num"]) < qm]
+        pairs.append((q, deps))
+    return pairs
+
+
+def parse_docs_for(raw):
+    """把 --docs-for 解析成 {测验编号: [讲义编号...]}。
+
+    支持 `5.5=5.1,5.2`，多组用 `;` 隔开：`5.5=5.1,5.2;5.6=5.3`。
+    全角符号也认，省得切换输入法。
+    """
+    out = {}
+    if not raw:
+        return out
+    for part in str(raw).replace("；", ";").split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise SystemExit(f"--docs-for 格式错误：{part}（应写成 5.5=5.1,5.2）")
+        qnum, nums = part.split("=", 1)
+        out[qnum.strip()] = [n.strip() for n in nums.replace("，", ",").split(",") if n.strip()]
+    return out
+
+
+def resolve_deps(nums, chapters, cat):
+    """把讲义编号还原成目录节点，返回 (nodes, 找不到的编号)。"""
+    pool = {}
+    for ch in chapters.values():
+        for n in ch["nodes"]:
+            if not QUIZ_NAME_RE.search(n["name"]):
+                pool.setdefault(str(n["num"]), n)
+    for c in cat:
+        if not QUIZ_NAME_RE.search(c.get("name") or ""):
+            pool.setdefault(str(c.get("num")), c)
+    nodes, missing = [], []
+    for num in nums:
+        n = pool.get(num)
+        if n is None:
+            missing.append(num)
+        else:
+            nodes.append(n)
+    return nodes, missing
+
+
+def load_flow(run_dir):
+    f = Path(run_dir) / "_flow.json"
+    if f.exists():
+        try:
+            return json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {"quizzes": {}}
+
+
+def save_flow(run_dir, flow):
+    flow["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    (Path(run_dir) / "_flow.json").write_text(
+        json.dumps(flow, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def docs_pages(num):
+    """cache/docs/<num>/ 下已有的讲义页数。"""
+    d = DOC_CACHE / str(num)
+    if not d.exists():
+        return 0
+    return len([p for p in d.iterdir() if p.suffix.lower() in (".png", ".jpg")])
+
+
+def grab_docs_for(page, cfg, cp, node, force=False):
+    """抓单个节点的讲义到 cache/docs/<章节号>/，已有则跳过。返回页数。"""
+    num = str(node["num"])
+    out_dir = DOC_CACHE / num
+    if not force:
+        have = docs_pages(num)
+        if have:
+            print(f"   {num} 讲义已存在（{have} 页），跳过")
+            return have
+    page.goto(cp.course_url(cfg, node["kid"]), wait_until="domcontentloaded", timeout=90000)
+    page.wait_for_timeout(12000)
+    roots = doc_roots(page)
+    if not roots:
+        print(f"   {num} 无讲义（纯视频节点）")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return 0
+    total = 0
+    for k, root in enumerate(roots, 1):
+        tag = "doc" if len(roots) == 1 else f"doc{k}"
+        total += grab_doc(page.context, root, out_dir, tag)
+    print(f"   {num} 讲义 {total} 页")
+    return total
+
+
+def build_solve_payload(quiz_dir, data, docs_meta):
+    """生成 solve_payload.md：把题目 + 依据材料打包成一份「待作答」文件。"""
+    qdir = Path(quiz_dir)
+    ch = data["chapter"]
+    qs = data["questions"]
+    L = []
+    L.append(f"# 待作答：{ch['num']} {ch['title']}（{len(qs)} 题）\n")
+    L.append("## 依据材料\n")
+    for num, pages in docs_meta.items():
+        if pages:
+            L.append(f"- `{num}`：{pages} 页，见 `cache/docs/{num}/doc_p01.png` 起")
+        else:
+            L.append(f"- `{num}`：**无讲义**（纯视频节点），涉及它的题 confidence 必须标 `low`")
+    L.append("")
+    L.append("## 作答要求\n")
+    L.append("1. 优先依据上面列出的讲义页；讲义未覆盖时用通用学科知识，但必须如实标注。")
+    L.append("2. `cite` 写成「讲义 X.Y 第N页（该页讲了什么）」；无依据写「通用学科知识（X.Y 无讲义）」。")
+    L.append("3. 每题做两遍：先正向定答案，再逐项否定干扰项；两遍不一致就把 `confidence` 降级。")
+    L.append("4. 不确定的题不要硬凑，标 `low` 并在 `verify.note` 里写明分歧点。")
+    L.append("5. 只写答案，不改题目。\n")
+    L.append("## 题目\n")
+    for q in qs:
+        L.append(f"### {q['no']}. {q['stem']}")
+        L.append("")
+        for o in q["options"]:
+            L.append(f"- {o['key']}. {o['text']}")
+        L.append("")
+    L.append("## 输出格式\n")
+    L.append("写入同目录 `answers.json`：\n")
+    L.append("```json")
+    L.append('{\n "generated_by": "AI 生成，逐题对照讲义双重校验",')
+    L.append(f' "policy": {{"course": "", "chapter": "{ch["num"]}", "purpose": "preview"}},')
+    L.append(' "answers": [')
+    L.append('  {"no": 1, "answer": ["B"], "source": "ai", "confidence": "high",')
+    L.append('   "explain": "为什么选它、为什么不选其他项",')
+    L.append('   "cite": "讲义 5.1 第3页（xxx）", "knowledge_tag": "知识点",')
+    L.append('   "verify": {"pass2": "B", "agree": true, "note": "两遍一致"}}')
+    L.append(" ]\n}")
+    L.append("```\n")
+    L.append("> 判断题 `answer` 写 `[\"对\"]` 或 `[\"错\"]`；多选题写全部字母如 `[\"A\",\"C\"]`。")
+    out = qdir / "solve_payload.md"
+    out.write_text("\n".join(L), encoding="utf-8")
+    return out
+
+
+def report_one(qf, watermark=None):
+    """用单个 questions.json + answers.json 出复习册。返回是否生成。"""
+    qf = Path(qf)
+    d = json.loads(qf.read_text(encoding="utf-8"))
+    af = qf.parent / "answers.json"
+    if not af.exists():
+        print(f"   {qf.parent.name}：缺少 answers.json，跳过出报告")
+        return False
+    a = json.loads(af.read_text(encoding="utf-8"))
+    title = f"{d['chapter']['num']} {d['chapter']['title']}"
+    meta = (f"{d.get('course', '')} · {len(d['questions'])} 题 · "
+            f"生成于 {d['policy']['fetched_at']} · "
+            f"策略 require_submitted={d['policy']['require_submitted']}")
+    wm = watermark or "参考答案 · 仅供预习与复习，考试以线下为准"
+    out = qf.parent / "参考答案.html"
+    build_report(d, a, out, wm, title, meta)
+    build_answer_key(d, a, qf.parent / "答案速查.md", title)
+    print(f"   已生成 {out.name} + 答案速查.md")
+    return True
+
+
+def quiz_auto(cfg, args, cp):
+    """一键：抓讲义 → 抓题 → 打包作答载荷 →（有答案时）出复习册。
+
+    与 play --all 的区别：play 的 --all 是整个目录的播放节点；
+    这里的 --all 只处理测验节点，且不会播放任何视频。
+    """
+    from playwright.sync_api import sync_playwright
+
+    cp.ensure_browser(cfg)
+    run_root = Path(cfg["output_dir"])
+    force = getattr(args, "force", False)
+
+    with sync_playwright() as p:
+        ctx = cp.connect(p, cfg).contexts[0]
+        page = cp.get_course_page(ctx, cfg)
+        cat = cp.get_catalog(page, cfg)
+        qcat = quiz_nodes(cat)
+        if not qcat:
+            print("目录里没有测验节点")
+            return 3
+
+        # ---- 选择目标测验 ----
+        if args.all:
+            targets = qcat
+        else:
+            args.from_ = _norm_num(getattr(args, "from_", None), qcat)
+            args.to = _norm_num(getattr(args, "to", None), qcat)
+            targets, unknown = cp.build_plan(qcat, args)
+            if unknown:
+                print("未识别：", unknown)
+            if not targets:
+                print("请用 --chapter/--chapters 指定章节，或 --all 处理全部测验")
+                return 3
+
+        # ---- 按章建立计划 ----
+        chapters = scan_chapters(cat)
+        docs_for = parse_docs_for(getattr(args, "docs_for", None))
+        jobs, blocked = [], []
+        for q in targets:
+            ch_num = str(q["num"]).split(".")[0]
+            ch = chapters.get(ch_num)
+            if not ch:
+                blocked.append((q, "目录里找不到所属章"))
+                continue
+            pairs = link_quiz_docs(ch)
+            dep_map = {qq["kid"]: deps for qq, deps in pairs}
+            override = docs_for.get(str(q["num"]))
+            if override:
+                deps, missing = resolve_deps(override, chapters, cat)
+                if missing:
+                    blocked.append((q, f"--docs-for 里的讲义编号不存在：{','.join(missing)}"))
+                    continue
+            else:
+                deps = dep_map.get(q["kid"], [])
+                if len(pairs) > 1:
+                    guess = ",".join(str(l["num"]) for l in ch["nodes"]
+                                     if not QUIZ_NAME_RE.search(l["name"])
+                                     and _minor(l["num"]) < _minor(q["num"]))
+                    hint = f"（可用 --docs-for {q['num']}={guess or '5.1,5.2'} 指定）"
+                    blocked.append((q, f"该章有 {len(pairs)} 套测验，无法自动判断依据{hint}"))
+                    continue
+            jobs.append({"chapter": ch, "quiz": q, "deps": deps})
+
+        unused = [k for k in docs_for if k not in {str(t["num"]) for t in targets}]
+        if unused:
+            print(f"  ⚠ --docs-for 里的 {','.join(unused)} 不在本次目标内，已忽略\n")
+
+        print(f"计划处理 {len(jobs)} 套测验：\n")
+        for j in jobs:
+            ch, q = j["chapter"], j["quiz"]
+            rdir = run_root / chapter_key(ch["num"])
+            flow = load_flow(rdir)
+            st = (flow["quizzes"].get(q["num"]) or {}).get("state", "todo")
+            deps_txt = " ".join(
+                f"{d['num']}({docs_pages(d['num']) or '无'}页)" for d in j["deps"]
+            ) or "（无讲义节点）"
+            print(f"  第{ch['num']}章 {ch['title']}")
+            print(f"    依据讲义：{deps_txt}")
+            print(f"    目标测验：{q['num']} {q['title']}  kid={q['kid']}")
+            print(f"    产物目录：{rdir.relative_to(run_root)}/quiz/{q['num']}/")
+            print(f"    当前状态：{st}")
+            print()
+        if blocked:
+            for q, why in blocked:
+                print(f"  ⚠ 跳过 {q['num']}：{why}")
+            print()
+        if getattr(args, "dry_run", False):
+            print("（--dry-run，未实际抓取）")
+            return 0
+        if not jobs:
+            return 3
+
+        # ---- 执行 ----
+        policy_required = args.require_submitted
+        summary = []
+        for j in jobs:
+            ch, q, deps = j["chapter"], j["quiz"], j["deps"]
+            rdir = run_root / chapter_key(ch["num"])
+            qdir = rdir / "quiz" / str(q["num"])
+            qdir.mkdir(parents=True, exist_ok=True)
+            flow = load_flow(rdir)
+            flow["chapter"] = {"num": ch["num"], "title": ch["title"]}
+            rec = flow["quizzes"].setdefault(str(q["num"]), {
+                "kid": q["kid"], "title": q["title"],
+                "dir": str(qdir.relative_to(run_root)).replace("\\", "/"),
+                "docs": [d["num"] for d in deps], "state": "todo"})
+            print(f"\n=== {q['num']} {q['title']} ===")
+
+            try:
+                # ① 讲义
+                pages = {}
+                if not getattr(args, "report_only", False):
+                    for d in deps:
+                        pages[str(d["num"])] = grab_docs_for(page, cfg, cp, d, force=force)
+                    rec["docs_pages"] = pages
+                    rec["state"] = "docs_ready"
+                    if any(v == 0 for v in pages.values()):
+                        rec["state"] = "no_docs" if not any(pages.values()) else "docs_ready"
+                    save_flow(rdir, flow)
+
+                    # ② 抓题
+                    qf = qdir / "questions.json"
+                    if qf.exists() and not force:
+                        print("   题目已存在，跳过抓取")
+                        rec["count"] = len(json.loads(qf.read_text(encoding="utf-8"))["questions"])
+                    else:
+                        r = fetch_one_quiz(page, cfg, q, qdir, policy_required)
+                        if r["status"] != "ok":
+                            rec["state"] = r["status"]
+                            save_flow(rdir, flow)
+                            summary.append((q["num"], r["status"]))
+                            continue
+                        rec["count"] = r["count"]
+                        rec["submitted"] = r["submitted"]
+                    rec["state"] = "fetched"
+                    save_flow(rdir, flow)
+
+                    # ③ 打包作答载荷
+                    data = json.loads(qf.read_text(encoding="utf-8"))
+                    payload = build_solve_payload(qdir, data, pages or {
+                        str(k): v for k, v in (rec.get("docs_pages") or {}).items()})
+                    rec["state"] = "packed"
+                    save_flow(rdir, flow)
+                    print(f"   已生成作答载荷 {payload.name}（{rec['count']} 题）")
+
+                # ④ 出报告
+                qf = qdir / "questions.json"
+                if qf.exists():
+                    made = report_one(qf)
+                    rec["has_answers"] = (qdir / "answers.json").exists()
+                    rec["has_report"] = made
+                    if made:
+                        rec["state"] = "reported"
+                    elif rec["has_answers"] is False:
+                        rec["state"] = "answers_pending"
+                save_flow(rdir, flow)
+                summary.append((q["num"], rec["state"]))
+            except Exception as e:
+                print(f"   ✗ 失败：{repr(e)[:160]}")
+                rec["state"] = "failed"
+                rec["error"] = repr(e)[:200]
+                save_flow(rdir, flow)
+                summary.append((q["num"], "failed"))
+
+        print("\n=== 汇总 ===")
+        for num, st in summary:
+            print(f"  {num:<8}{st}")
+        pending = [n for n, s in summary if s in ("packed", "answers_pending")]
+        if pending:
+            print(f"\n待作答：{', '.join(pending)}")
+            print("  这些套的 solve_payload.md 已就绪，作答后跑 "
+                  "`quiz auto --chapters <编号> --report-only` 出复习册")
     return 0
