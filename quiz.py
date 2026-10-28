@@ -37,27 +37,36 @@ TYPE_BY_LABEL = [
 JS_QUESTIONS = r"""
 () => {
   const clean = (el) => el ? (el.innerText || '').replace(/\s+/g, ' ').trim() : '';
-  const typeOf = (q) => {
-    const rows = [...q.querySelectorAll('ul.Zy_ulTop > li')];
-    const qt = rows.length ? (rows[0].getAttribute('qtype') || '') : '';
-    return qt;
-  };
   const qs = [...document.querySelectorAll('.TiMu')].map((q, i) => {
     const stemEl = q.querySelector('.Zy_TItle > div.font-cxsecret') || q.querySelector('.Zy_TItle');
-    const opts = [...q.querySelectorAll('ul.Zy_ulTop > li')].map(li => {
+    const rows = [...q.querySelectorAll('ul.Zy_ulTop > li')];
+    const opts = rows.map((li, k) => {
       const num = li.querySelector('.num_option');
-      const after = li.querySelector('a.after');
-      return {
-        letter: (num ? (num.getAttribute('data') || clean(num)) : '').trim(),
-        text: clean(after)
-      };
+      const iTag = li.querySelector('i.fl') || li.querySelector('i');
+      const rawLetter = num ? (num.getAttribute('data') || clean(num)) : clean(iTag);
+      const letter = (rawLetter || '').replace(/[、.．:：\s]/g, '').slice(0, 2)
+                     || String.fromCharCode(65 + k);
+      const a = li.querySelector('a.after') || li.querySelector('a');
+      let text = a ? clean(a) : clean(li);
+      text = text.replace(/^[A-Za-z][、.．:：]\s*/, '').trim();
+      return { letter, text };
     });
+    const myAns = clean(q.querySelector('.myAnswer .answerCon')) ||
+                  clean(q.querySelector('.myAnswer')) ||
+                  '';
+    const scoreTxt = clean(q.querySelector('.answerScore')) ||
+                     clean(q.querySelector('[class*="score"]')) || '';
+    const markCls = ['.dui', '.cuo', '.right', '.wrong', '.correct', '.error']
+      .map(s => q.querySelector(s)).filter(Boolean).map(e => e.className).join('|');
     return {
       idx: i + 1,
       qid: (q.parentElement ? (q.parentElement.id || '') : '').replace('question', ''),
-      qtype: typeOf(q),
+      qtype: rows.length ? (rows[0].getAttribute('qtype') || '') : '',
       stem: clean(stemEl),
-      options: opts
+      options: opts,
+      myAnswerText: myAns.replace(/^我的答案[:：]?\s*/, ''),
+      scoreText: scoreTxt,
+      markCls: markCls.slice(0, 80)
     };
   });
   return {
@@ -139,7 +148,7 @@ def build_mapping(font_bytes, min_conf=0.58):
             pass
 
     tmp = CACHE_DIR / f"{key}.ttf"
-    tmp.write_bytes(font_bytes)
+    tmp.write_bytes(font_bytes)  # 保留字体文件，便于事后复核/重新生成对照表
     cmap = TTFont(str(tmp)).getBestCmap()
     cps = sorted(cmap.keys())
 
@@ -170,12 +179,16 @@ def build_mapping(font_bytes, min_conf=0.58):
         if v is None:
             continue
         sims = M @ v
-        i = int(np.argmax(sims))
+        order = np.argsort(sims)[::-1]
+        i, j = int(order[0]), int(order[1]) if len(order) > 1 else int(order[0])
         conf = float(sims[i])
-        if conf < min_conf:
-            low.append({"cp": hex(cp), "char": chr(cp), "guess": cands[i], "conf": round(conf, 3)})
-            continue
+        margin = float(sims[i] - sims[j])
+        # 置信度低、或与第二名太接近（易混字）：先按最优猜测解码，同时登记待核对
         mapping[cp] = cands[i]
+        if conf < min_conf or margin < 0.045:
+            low.append({"cp": hex(cp), "char": chr(cp), "guess": cands[i],
+                        "conf": round(conf, 3), "margin": round(margin, 3),
+                        "runner_up": cands[j]})
 
     cache.write_text(json.dumps({"map": {str(k): v for k, v in mapping.items()},
                                  "low": low}, ensure_ascii=False, indent=1),
@@ -220,15 +233,35 @@ def normalize_question(q, mapping):
         if not key or len(key) > 2:
             key = chr(ord("A") + i)
         opts.append({"key": key, "text": decode(o["text"], mapping)})
+    if qtype == "judge":
+        opts = [{"key": "对", "text": "对"}, {"key": "错", "text": "错"}]
+
+    # 已提交视图会带「我的答案」与本题得分
+    my_raw = decode((q.get("myAnswerText") or "").strip(), mapping)
+    if qtype == "judge":
+        if "对" in my_raw or "正确" in my_raw:
+            my_ans = ["对"]
+        elif "错" in my_raw or "错误" in my_raw:
+            my_ans = ["错"]
+        else:
+            my_ans = None
+    else:
+        my_ans = [c for c in my_raw.upper() if c in "ABCDEFGH"] or None
+    score_txt = (q.get("scoreText") or "").strip()
+    score = None
+    m = re.search(r"(-?\d+(?:\.\d+)?)", score_txt)
+    if m:
+        score = float(m.group(1))
     return {
         "no": q["idx"],
         "qid": q.get("qid", ""),
         "type": qtype,
         "stem": stem,
         "options": opts,
-        "my_answer": None,
-        "is_correct": None,
-        "score": None,
+        "my_answer": my_ans,
+        "is_correct": None if score is None else (score > 0),
+        "score": score,
+        "score_text": score_txt,
     }
 
 
@@ -398,7 +431,7 @@ def build_report(quiz_data, answers, out_path, watermark, title, meta):
 
 
 def cmd_quiz(cfg, args, cp):
-    """quiz 子命令入口（list / fetch / report）。"""
+    """quiz 子命令入口（list / fetch / report / docs）。"""
     sub = args.quiz_cmd
     if sub == "list":
         return quiz_list(cfg, cp)
@@ -406,6 +439,8 @@ def cmd_quiz(cfg, args, cp):
         return quiz_fetch(cfg, args, cp)
     if sub == "report":
         return quiz_report(cfg, args)
+    if sub == "docs":
+        return quiz_docs(cfg, args, cp)
     return 1
 
 
@@ -416,7 +451,7 @@ def quiz_list(cfg, cp):
         ctx = cp.connect(p, cfg).contexts[0]
         page = cp.get_course_page(ctx, cfg)
         cat = cp.get_catalog(page, cfg)
-        rows = [c for c in cat if re.search(r"(测验|测试|作业|习题)", c["name"]) and c["level"] == 2]
+        rows = [c for c in quiz_nodes(cat) if c["level"] == 2]
         print(f"{'编号':<8}{'knowledgeid':<14}标题")
         print("-" * 60)
         for c in rows:
@@ -424,6 +459,45 @@ def quiz_list(cfg, cp):
         print("-" * 60)
         print(f"共 {len(rows)} 个测验/作业节点（共 {len(cat)} 个目录节点）")
     return 0
+
+
+WORK_URL_HINTS = ("doHomeWorkNew", "selectWorkQuestionYiPiYue", "work/doHomeWork",
+                  "selectWorkQuestion")
+
+
+def find_work_frame(page):
+    """找承载测验内容的 frame（不同入口端点不一样，不要写死）。"""
+    for f in page.frames:
+        u = f.url or ""
+        if any(h in u for h in WORK_URL_HINTS):
+            return f
+    for f in page.frames:  # 兜底：看有没有题目容器
+        try:
+            if f.evaluate("() => !!document.querySelector('.TiMu')"):
+                return f
+        except Exception:
+            continue
+    return None
+
+
+QUIZ_NAME_RE = re.compile(r"(测验|测试|作业|习题)")
+
+
+def quiz_nodes(cat):
+    """只保留测验/作业类节点，供选择解析用。"""
+    return [c for c in cat if QUIZ_NAME_RE.search(c["name"])]
+
+
+def _norm_num(num, qcat):
+    """把 '2' 归一成 '2.2' 这种真实存在的编号，便于 --from/--to 匹配。"""
+    if not num:
+        return num
+    if any(c["num"] == num for c in qcat):
+        return num
+    for c in qcat:
+        if c["num"].startswith(num + "."):
+            return c["num"]
+    return num
 
 
 def quiz_fetch(cfg, args, cp):
@@ -436,12 +510,27 @@ def quiz_fetch(cfg, args, cp):
         ctx = cp.connect(p, cfg).contexts[0]
         page = cp.get_course_page(ctx, cfg)
         cat = cp.get_catalog(page, cfg)
-        plan, unknown = cp.build_plan(cat, args) if hasattr(cp, "build_plan") else ([], [])
+
+        # 关键：选择只在「测验节点」范围内解析，语义才符合直觉
+        qcat = quiz_nodes(cat)
+        if not qcat:
+            print("这门课的目录里没有找到测验/作业节点")
+            return 3
+        args.from_ = _norm_num(args.from_, qcat)
+        args.to = _norm_num(args.to, qcat)
+        plan, unknown = cp.build_plan(qcat, args)
         if not plan:
-            print("请用 --chapters 指定章节（例如 2.2）")
+            print("请用 --chapters 指定测验（例如 2.2），或 --all 抓全部")
             return 3
         if unknown:
             print("未识别:", unknown)
+
+        print(f"计划抓取 {len(plan)} 套测验（课程共 {len(qcat)} 套）：")
+        for c in plan:
+            print(f"  - {c['num']:<8}{c['title']}")
+        if getattr(args, "dry_run", False):
+            print("（--dry-run，未实际抓取）")
+            return 0
 
         policy_required = args.require_submitted
         records = []
@@ -452,7 +541,7 @@ def quiz_fetch(cfg, args, cp):
                 if (el) { (el.querySelector('.posCatalog_name') || el).click(); }
             }""", chap["kid"])
             page.wait_for_timeout(7000)
-            wf = next((f for f in page.frames if "doHomeWorkNew" in (f.url or "")), None)
+            wf = find_work_frame(page)
             if wf is None:
                 print("   没有测验内容，跳过")
                 records.append({"kid": chap["kid"], "num": chap["num"], "status": "no_work"})
@@ -523,3 +612,119 @@ def quiz_report(cfg, args):
         print("已生成", out, "和", md.name)
         made += 1
     return 0 if made else 1
+
+
+# --------------------------------------------------------------------------- #
+# 讲义抓取：给答案提供可核验的课程依据
+# --------------------------------------------------------------------------- #
+DOC_CACHE = TOOL_DIR / "cache" / "docs"
+
+JS_DOC_IMGS = r"""
+() => [...document.querySelectorAll('img')]
+  .map(i => i.src || '')
+  .filter(s => s.includes('/thumb/'))
+"""
+
+
+def doc_roots(page):
+    """从文档查看器里取出整页图片的根地址（去掉 thumb/N.png 尾巴）。
+
+    平台把每页渲染成 s3.cldisk.com/.../thumb/N.png，剥掉尾部即可按页遍历。
+    """
+    out = []
+    for f in page.frames:
+        try:
+            srcs = f.evaluate(JS_DOC_IMGS)
+        except Exception:
+            continue
+        for s in srcs or []:
+            m = re.match(r"^(https?://[^?#]+?)/thumb/\d+\.(?:png|jpg|webp)$", s)
+            if m and m.group(1) not in out:
+                out.append(m.group(1))
+    return out
+
+
+def grab_doc(ctx, root, out_dir, tag="doc", max_pages=200):
+    """按页抓取讲义图片，遇到非 200 / 非图片就停。"""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    n = 0
+    for i in range(1, max_pages + 1):
+        for ext in ("png", "jpg"):
+            u = f"{root}/thumb/{i}.{ext}"
+            try:
+                r = ctx.request.get(u, timeout=30000)
+            except Exception:
+                continue
+            if r.status != 200:
+                continue
+            body = r.body()
+            if len(body) < 2000:
+                continue
+            if ext == "png" and body[1:4] != b"PNG":
+                continue
+            if ext == "jpg" and body[:2] != b"\xff\xd8":
+                continue
+            (out_dir / f"{tag}_p{i:02d}.{ext}").write_bytes(body)
+            n += 1
+            break
+        else:
+            break
+    return n
+
+
+def quiz_docs(cfg, args, cp):
+    """抓取选中章节的讲义整页图，存到 cache/docs/<章节号>/。
+
+    这是提升答案准确率的关键一步：有讲义时答案可引用具体页，
+    没有讲义时只能靠通用知识，置信度必须下调。
+    """
+    from playwright.sync_api import sync_playwright
+
+    cp.ensure_browser(cfg)
+    with sync_playwright() as p:
+        ctx = cp.connect(p, cfg).contexts[0]
+        page = cp.get_course_page(ctx, cfg)
+        cat = cp.get_catalog(page, cfg)
+
+        plan, unknown = cp.build_plan(cat, args)
+        if unknown:
+            print("未识别：", unknown)
+        plan = [c for c in plan if not QUIZ_NAME_RE.search(c["name"])]
+        if not plan:
+            print("没有可抓讲义的章节节点（测验节点已排除）")
+            return 3
+
+        print(f"计划抓取 {len(plan)} 节的讲义：")
+        for c in plan:
+            print(f"  - {c['num']:<6}{c['title']}")
+        if getattr(args, "dry_run", False):
+            return 0
+
+        index = {}
+        for c in plan:
+            page.goto(cp.course_url(cfg, c["kid"]), wait_until="domcontentloaded", timeout=90000)
+            page.wait_for_timeout(12000)
+            roots = doc_roots(page)
+            out_dir = DOC_CACHE / str(c["num"])
+            if not roots:
+                print(f"  {c['num']} {c['title']}: 无讲义（纯视频节点）")
+                index[c["num"]] = {"title": c["title"], "kid": c["kid"],
+                                   "pages": 0, "roots": []}
+                continue
+            total = 0
+            for k, root in enumerate(roots, 1):
+                tag = "doc" if len(roots) == 1 else f"doc{k}"
+                got = grab_doc(ctx, root, out_dir, tag)
+                print(f"    源{k}: {got} 页 {root[:80]}")
+                total += got
+            print(f"  {c['num']} {c['title']}: 共 {total} 页 -> {out_dir}")
+            index[c["num"]] = {"title": c["title"], "kid": c["kid"],
+                               "pages": total, "roots": roots}
+
+        DOC_CACHE.mkdir(parents=True, exist_ok=True)
+        (DOC_CACHE / "_index.json").write_text(
+            json.dumps(index, ensure_ascii=False, indent=1), encoding="utf-8")
+        have = sum(1 for v in index.values() if v["pages"])
+        print(f"完成：{have}/{len(index)} 节有讲义，共 "
+              f"{sum(v['pages'] for v in index.values())} 页 -> {DOC_CACHE}")
+    return 0

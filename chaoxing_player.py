@@ -1035,13 +1035,24 @@ def main():
     qf.add_argument("--require-submitted", dest="require_submitted", action="store_true")
     qf.add_argument("--no-require-submitted", dest="require_submitted", action="store_false")
     qf.add_argument("--run", help="输出目录名")
+    qf.add_argument("--dry-run", action="store_true", help="只打印要抓哪些测验，不实际抓取")
     qf.set_defaults(func=cmd_quiz_entry, require_submitted=None, from_=None, to=None,
-                     all=False, index=None, chapters=None)
+                     all=False, index=None, chapters=None, dry_run=False)
 
     qr = qzsub.add_parser("report", help="用 questions.json + answers.json 生成学生版复习册")
     qr.add_argument("run_dir")
     qr.add_argument("--watermark", help="页眉用途声明")
     qr.set_defaults(func=cmd_quiz_entry)
+
+    qd = qzsub.add_parser("docs", help="抓取指定章节的讲义整页图片，作为答题依据")
+    qd.add_argument("--chapters", help="章节编号，如 5.1,5.2 或 5")
+    qd.add_argument("--from", dest="from_", help="起始编号")
+    qd.add_argument("--to", help="结束编号")
+    qd.add_argument("--all", action="store_true", help="目录全部非测验节点")
+    qd.add_argument("--index", nargs="+", type=int)
+    qd.add_argument("--dry-run", action="store_true", help="只打印要抓哪些节点")
+    qd.set_defaults(func=cmd_quiz_entry, from_=None, to=None,
+                     all=False, index=None, chapters=None, dry_run=False)
 
     args = ap.parse_args()
     cfg = load_config()

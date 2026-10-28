@@ -141,32 +141,61 @@ python chaoxing_player.py analyze runs/20261027-153000
 # 1) 看课程里有哪些测验
 python chaoxing_player.py quiz list
 
-# 2) 抓题（只读；未提交的测验默认也允许，可用 --require-submitted 收紧）
-python chaoxing_player.py quiz fetch --chapters 2.2 --run quiz-ch2
-python chaoxing_player.py quiz fetch --all --require-submitted
+# 2) 先抓讲义，给答案铺依据（强烈建议，见下节）
+python chaoxing_player.py quiz docs --chapters 5.1,5.2,5.3
+python chaoxing_player.py quiz docs --from 5 --to 6 --dry-run   # 只看抓哪些
 
-# 3) 人工/模型整理答案后写 answers.json，再生成复习册
-python chaoxing_player.py quiz report runs/quiz-ch2
+# 3) 抓题（只读；未提交的测验默认也允许，可用 --require-submitted 收紧）
+python chaoxing_player.py quiz fetch --chapters 5.5 --run quiz-ch5
+
+# 4) 整理答案写入 answers.json，再生成复习册
+python chaoxing_player.py quiz report runs/quiz-ch5
 ```
 
-`fetch` 产出 `questions.json`（题面、选项、题型、分组）；`report` 需要同目录下存在
-`answers.json`，两者合并生成 `参考答案.html` 与 `答案速查.md`。
+`docs` 抓讲义、`fetch` 出 `questions.json`（题面、选项、题型、分组）；
+`report` 需要同目录下存在 `answers.json`，两者合并生成 `参考答案.html` 与 `答案速查.md`。
 
 `answers.json` 每题的字段：
 
 ```json
-{"no": 1, "answer": ["B"], "source": "ai", "confidence": "high",
+{"no": 1, "answer": ["B"], "source": "ai", "confidence": "medium",
  "explain": "……为什么选它，为什么不选其他项……",
- "cite": "第 2 章讲义 p13", "knowledge_tag": "无菌室空气消毒"}
+ "cite": "讲义 5.1 第11页（细胞起始密度的定义）",
+ "knowledge_tag": "细胞起始密度",
+ "verify": {"pass2": "B", "agree": true, "note": "讲义无具体数值，依据来自通用经验值"}}
 ```
 
 - `source`：`platform`（平台给的答案）/ `inferred`（从逐题对错反推）/ `ai`（生成）
 - `confidence`：`high` / `medium` / `low`，会显示在复习册的徽标上
-- `cite` 建议指向已抽好的讲义页，这是 AI 答案可信度的主要依据
+- `cite` 必须指向真实可查的位置（讲义第几页），没有依据时写「通用学科知识（X 无讲义）」
+- `verify` 记录第二遍校验结果；两遍不一致时把 `confidence` 降级
 
 **关于文字反爬**：平台的题干会被替换成生僻字码位，靠内嵌字体还原显示。
 本项目用字形位图匹配自动反解（拿内嵌字体的字形与系统 `Noto Sans SC` 逐字比对），
 实测准确率约 97%；映射按字体哈希缓存在 `cache/fonts/`，可人工校订后写回缓存。
+
+### 参考答案是怎么来的
+
+这一点必须说清楚，否则容易高估产物的可靠性：
+
+**代码不生成答案。** `quiz.py` 只做三件事——抓题、反解混淆、把题与答案渲染成页面。
+`answers.json` 是外部输入，由人（或对话中的模型）在 `questions.json` 基础上逐题写出。
+项目里没有任何大模型 API 调用，也没有联网检索答案。
+
+答案质量取决于**证据基础**，按可靠性分三层：
+
+| 层级 | 依据 | 可靠性 | 怎么拿到 |
+|---|---|---|---|
+| L1 | 平台给出的答案 | 最高 | 教师开放「查看答案」 |
+| L2 | 平台判分反推 | 高 | 测验已提交且该题答对，正确项 = 所选项 |
+| L3 | 本课讲义 | 中高 | `quiz docs` 抓下来，答案可引具体页 |
+| L4 | 通用模型记忆 | 中低 | 无上述依据时只能用这个，置信度必须下调 |
+
+`quiz docs` 存在的意义就是把 L4 抬到 L3。实测对比（同一套 18 题的 5.5 测验）：
+不抓讲义时全部落在 L4，只能标「通用学科知识」；抓了 5.1–5.3 共 31 页讲义后，
+13 题能指向具体页，高置信度题从 0 提升到 10。
+
+**产物里低置信度的题不要直接发给学生**，人工过一遍再定稿。
 
 ## 输出
 
