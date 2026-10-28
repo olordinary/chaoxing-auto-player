@@ -1,8 +1,10 @@
 # 运行产物
 runs/
+cache/
 *.log
 state.json
 _diag.txt
+_q.log
 
 # 本地配置（里面有你的课程参数）
 config.json

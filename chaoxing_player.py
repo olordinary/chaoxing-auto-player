@@ -45,6 +45,10 @@ DEFAULT_CONFIG = {
     "profile_dir": str(TOOL_DIR / "profile"),
     "output_dir": str(TOOL_DIR / "runs"),
     "course": {},
+    "quiz_policy": {
+        "require_submitted": False,
+        "watermark": "参考答案 · 仅供预习与复习，考试以线下为准",
+    },
 }
 
 EDGE_CANDIDATES = [
@@ -956,9 +960,18 @@ def cmd_control(cfg, args):
     return 0
 
 
+def cmd_quiz_entry(cfg, args):
+    """测验相关子命令入口，转发到 quiz 模块。"""
+    import importlib
+    quiz = importlib.import_module("quiz")
+    if getattr(args, "require_submitted", None) is None:
+        args.require_submitted = bool((cfg.get("quiz_policy") or {}).get("require_submitted", False))
+    return quiz.cmd_quiz(cfg, args, sys.modules[__name__])
+
+
 # --------------------------------------------------------------------------- #
 def main():
-    ap = argparse.ArgumentParser(description="超星 / 学习通 章节视频连播控制器")
+    ap = argparse.ArgumentParser(description="超星 / 学习通 章节视频连播与测验整理工具")
     ap.add_argument("--version", action="version", version=f"chaoxing-auto-player {VERSION}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -1006,6 +1019,29 @@ def main():
     ct.add_argument("run_dir")
     ct.add_argument("action", choices=["pause", "resume", "stop"])
     ct.set_defaults(func=cmd_control)
+
+    qz = sub.add_parser("quiz", help="章节测验：抓题 / 生成参考答案复习册")
+    qzsub = qz.add_subparsers(dest="quiz_cmd", required=True)
+
+    ql = qzsub.add_parser("list", help="列出课程里的测验节点")
+    ql.set_defaults(func=cmd_quiz_entry)
+
+    qf = qzsub.add_parser("fetch", help="抓取指定测验的题目（只读）")
+    qf.add_argument("--chapters", help="测验编号，如 2.2 或 2.2,3.2")
+    qf.add_argument("--from", dest="from_", help="起始编号")
+    qf.add_argument("--to", help="结束编号")
+    qf.add_argument("--all", action="store_true", help="全部测验节点")
+    qf.add_argument("--index", nargs="+", type=int)
+    qf.add_argument("--require-submitted", dest="require_submitted", action="store_true")
+    qf.add_argument("--no-require-submitted", dest="require_submitted", action="store_false")
+    qf.add_argument("--run", help="输出目录名")
+    qf.set_defaults(func=cmd_quiz_entry, require_submitted=None, from_=None, to=None,
+                     all=False, index=None, chapters=None)
+
+    qr = qzsub.add_parser("report", help="用 questions.json + answers.json 生成学生版复习册")
+    qr.add_argument("run_dir")
+    qr.add_argument("--watermark", help="页眉用途声明")
+    qr.set_defaults(func=cmd_quiz_entry)
 
     args = ap.parse_args()
     cfg = load_config()
