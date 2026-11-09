@@ -407,30 +407,47 @@ def extract_json(text):
 
 REPAIR_PROMPT = ("上一条回复不是合法 JSON，无法解析。请只输出一个 JSON 对象，"
                  "不要任何解释文字、不要 Markdown 代码围栏、不要注释。")
+TYPE_PROMPT = ("上一条回复的顶层类型不对：需要的是单个 JSON 对象（以 { 开头），"
+               "而不是数组或其它类型。请按原来的要求重新输出一个 JSON 对象。")
 
 
-def chat_json(cfg, messages, provider=None, model=None, max_repair=1, **kw):
-    """要 JSON 的对话：解析失败会自动让模型重发一次。返回 (obj, meta)。"""
+def chat_json(cfg, messages, provider=None, model=None, max_repair=1, expect=None, **kw):
+    """要 JSON 的对话：解析失败或顶层类型不符，会自动让模型重发一次。
+
+    返回 (obj, meta)。expect="object" / "list" 会额外校验顶层类型——
+    第二遍复核时模型很容易把 answers 直接当顶层数组吐出来，
+    只校验「能解析」是不够的，否则下游 obj.get() 会直接炸。
+    """
+    def _ok(o):
+        if o is None:
+            return False
+        if expect == "object" and not isinstance(o, dict):
+            return False
+        if expect == "list" and not isinstance(o, list):
+            return False
+        return True
+
     meta = {"calls": [], "repairs": 0}
     resp = chat(cfg, messages, provider=provider, model=model, json_mode=True, **kw)
     meta["calls"].append(resp)
     obj = extract_json(resp["text"])
-    if obj is not None:
+    if _ok(obj):
         return obj, meta
 
+    prompt = TYPE_PROMPT if obj is not None else REPAIR_PROMPT
     convo = list(messages) + [{"role": "assistant", "content": resp["text"][:4000]},
-                              {"role": "user", "content": REPAIR_PROMPT}]
+                              {"role": "user", "content": prompt}]
     for _ in range(max_repair):
         meta["repairs"] += 1
         resp = chat(cfg, convo, provider=provider, model=model, json_mode=True,
                     temperature=0, **kw)
         meta["calls"].append(resp)
         obj = extract_json(resp["text"])
-        if obj is not None:
+        if _ok(obj):
             return obj, meta
         convo += [{"role": "assistant", "content": resp["text"][:2000]},
-                  {"role": "user", "content": REPAIR_PROMPT}]
-    raise LLMError(f"模型连续 {1 + max_repair} 次都没给出合法 JSON。"
+                  {"role": "user", "content": TYPE_PROMPT if obj is not None else REPAIR_PROMPT}]
+    raise LLMError(f"模型连续 {1 + max_repair} 次都没给出合法的 JSON 对象。"
                    f"最后一段输出：{resp['text'][:300]}")
 
 

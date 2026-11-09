@@ -343,6 +343,10 @@ def build_messages(data, batch, digest_text, evidence_text, pass_no):
               '{"answers":[{"no":1,"rationale_options":{"A":"错误，因为…","B":"正确，因为…"},'
               '"answer":["B"],"confidence":"high|medium|low",'
               '"explain":"汇总说明","cite":"…","knowledge_tag":"…","doubt":""}]}']
+    # 实测第二遍复核时模型容易把 answers 直接当顶层数组吐出来，
+    # 这里明确约束顶层类型，减少下游解析踩空。
+    L += ["", "【格式硬约束】顶层必须是单个 JSON 对象（以 { 开头、以 } 结尾），"
+              "不要输出顶层数组，不要夹带解释文字或 Markdown 代码围栏。"]
     return [{"role": "system", "content": _sys(pass_no)},
             {"role": "user", "content": "\n".join(L)}]
 
@@ -356,10 +360,11 @@ def _call_batch(cfg, provider, data, batch, digest_text, evidence_text, pass_no,
     try:
         obj, meta = llm.chat_json(cfg, msgs, provider=provider["name"], max_repair=1,
                                   max_tokens=min(8192, 1200 + 900 * len(batch)),
-                                  retries=max_retries)
-    except llm.LLMError as e:
+                                  retries=max_retries, expect="object")
+    except Exception as e:      # 不能只抓 LLMError：模型返回的结构不合预期时也会抛
+        err = f"{type(e).__name__}: {e}"[:300]
         if len(batch) == 1:
-            return {batch[0]["no"]: {"_error": str(e)[:200]}}, [{"error": str(e)[:300]}]
+            return {batch[0]["no"]: {"_error": err}}, [{"error": err}]
         mid = max(1, len(batch) // 2)
         a, ma = _call_batch(cfg, provider, data, batch[:mid], digest_text, evidence_text,
                             pass_no, max_retries)
@@ -369,7 +374,19 @@ def _call_batch(cfg, provider, data, batch, digest_text, evidence_text, pass_no,
         return a, ma + mb
 
     got = {}
-    for item in (obj.get("answers") or obj.get("data") or []):
+    # 模型可能把答案直接当顶层数组返回（第二遍复核尤其常见），
+    # 也可能给 {"answers": {...}} 这种以题号为键的对象，统一收敛成条目列表。
+    if isinstance(obj, list):
+        items = obj
+    elif isinstance(obj, dict):
+        items = obj.get("answers") or obj.get("data") or []
+        if isinstance(items, dict):
+            items = list(items.values())
+    else:
+        items = []
+    parsed_type = type(obj).__name__
+
+    for item in items:
         if not isinstance(item, dict):
             continue
         try:
@@ -377,7 +394,7 @@ def _call_batch(cfg, provider, data, batch, digest_text, evidence_text, pass_no,
         except Exception:
             continue
         got[no] = item
-    calls = [{"stage": f"pass{pass_no}", "n": len(batch),
+    calls = [{"stage": f"pass{pass_no}", "n": len(batch), "parsed": parsed_type,
               "latency_ms": c["latency_ms"], "usage": c["usage"],
               "attempts": c["attempts"], "chars": sum(
                   len(m.get("content") or "") if isinstance(m.get("content"), str) else 0
@@ -408,7 +425,12 @@ def run_pass(cfg, provider, data, batches, digest_text, evidence_by_no, pass_no,
 
     def work(t):
         bi, batch, ev = t
-        return bi, _call_batch(cfg, provider, data, batch, digest_text, ev, pass_no)
+        try:
+            return bi, _call_batch(cfg, provider, data, batch, digest_text, ev, pass_no)
+        except Exception as e:
+            # 一批炸掉不能拖垮整遍：把这一批的题都标记为失败，其余批次照常
+            err = f"{type(e).__name__}: {e}"[:200]
+            return bi, ({q["no"]: {"_error": err} for q in batch}, [{"error": err}])
 
     if workers and workers > 1:
         with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -858,7 +880,7 @@ def solve_quiz(cfg, qdir, opts):
     if mode != "off":
         targets = pick_search_targets(questions, pass1, mode)
         if targets:
-            limit = int(opts.get("search_limit", 8))
+            limit = int(opts.get("search_limit", 15))
             print(f"   ③ 联网检索（{len(targets)} 题待查，上限 {limit} 次）")
             evidence, audit, search_ok = do_search(
                 cfg, questions, targets, limit,
@@ -874,12 +896,21 @@ def solve_quiz(cfg, qdir, opts):
                 json.dumps(audit, ensure_ascii=False, indent=1), encoding="utf-8")
 
     # ④ 独立复核
-    if opts.get("pass2", True):
+    has_pass2 = bool(opts.get("pass2", True))
+    if has_pass2:
         print(f"   ④ 第二遍独立复核（{len(batches)} 批）")
-        pass2, calls2 = run_pass(cfg, provider, data, batches, digest_text,
-                                 evidence if search_ok else None, 2,
-                                 workers=int(opts.get("workers", 1)))
-        run_info["calls"] += calls2
+        try:
+            pass2, calls2 = run_pass(cfg, provider, data, batches, digest_text,
+                                     evidence if search_ok else None, 2,
+                                     workers=int(opts.get("workers", 1)))
+            run_info["calls"] += calls2
+        except Exception as e:
+            # 复核只是"加分项"：它挂了不该把第一遍的成果一起扔掉。
+            # 降级为单遍结果，置信度上限自然落到 medium。
+            why = f"{type(e).__name__}: {str(e)[:160]}"
+            print(f"   ⚠ 复核失败（{why}），降级为单遍结果，置信度上限 medium")
+            pass2, has_pass2 = {}, False
+            run_info["pass2_degraded"] = why
     else:
         print("   ④ 已按 --no-pass2 跳过复核")
         pass2 = {}
@@ -890,7 +921,6 @@ def solve_quiz(cfg, qdir, opts):
         run_info["tokens"]["prompt"] += int(u.get("prompt_tokens") or 0)
         run_info["tokens"]["completion"] += int(u.get("completion_tokens") or 0)
 
-    has_pass2 = bool(opts.get("pass2", True))
     answers = []
     for q in questions:
         a1 = pass1.get(q["no"]) or {}
@@ -902,7 +932,15 @@ def solve_quiz(cfg, qdir, opts):
                             "verify": {"pass1": None, "pass2": None, "agree": False,
                                        "note": "模型调用失败：" + a1["_error"][:120]}})
             continue
-        answers.append(finalize(q, a1, a2, bool(digest_text), search_ok, has_pass2))
+        try:
+            answers.append(finalize(q, a1, a2, bool(digest_text), search_ok, has_pass2))
+        except Exception as e:
+            # 单题定稿异常也要留一条，保证产物里题号齐全、便于人工补
+            answers.append({"no": q["no"], "answer": [], "source": "ai",
+                            "confidence": "low", "explain": "", "cite": "",
+                            "knowledge_tag": "",
+                            "verify": {"pass1": None, "pass2": None, "agree": False,
+                                       "note": f"定稿异常：{type(e).__name__}: {str(e)[:100]}"}})
 
     n_high = sum(1 for a in answers if a["confidence"] == "high")
     n_ans = sum(1 for a in answers if a["answer"])
@@ -1013,7 +1051,7 @@ def make_opts(args, report=True):
         "vision": g("vision", "auto") or "auto",
         "batch": g("batch", 5) or 5,
         "limit": g("limit", 0) or 0,
-        "search_limit": g("search_limit", 8) or 8,
+        "search_limit": g("search_limit", 15) or 15,
         "fetch_pages": g("fetch_pages", 0) or 0,
         "max_doc_chars": g("max_doc_chars", 9000) or 9000,
         "workers": g("workers", 1) or 1,

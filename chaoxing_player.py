@@ -1147,8 +1147,8 @@ def main():
                     help="是否用视觉模型读讲义页（默认 auto）")
     qs.add_argument("--batch", type=int, default=5, help="每批几题（默认 5）")
     qs.add_argument("--limit", type=int, default=0, help="每套只作答前 N 题（试跑用）")
-    qs.add_argument("--search-limit", dest="search_limit", type=int, default=8,
-                    help="每套最多检索几次（默认 8）")
+    qs.add_argument("--search-limit", dest="search_limit", type=int, default=15,
+                    help="每套最多检索几道题（默认 15，按题号取前 N 个待查项）")
     qs.add_argument("--fetch-pages", dest="fetch_pages", type=int, default=0,
                     help="检索摘要太短时，抓前 N 条网页正文补充（默认 0）")
     qs.add_argument("--max-doc-chars", dest="max_doc_chars", type=int, default=9000,

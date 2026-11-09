@@ -59,6 +59,8 @@ class MockLLM:
 
     def __init__(self):
         self.calls = []
+        self.list_once = False      # True 时第二遍故意先返回顶层数组，模拟真实模型的坏习惯
+        self._list_done = False
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -161,6 +163,10 @@ class MockLLM:
                     k: ("正确，符合讲义表述" if k in ans else "错误，与讲义表述不符")
                     for k in keys or ["A", "B"]}
             out.append(item)
+        if pass2 and self.list_once and not self._list_done:
+            # 模拟实测到的情况：第二遍把 answers 直接当顶层数组吐出来
+            self._list_done = True
+            return json.dumps(out, ensure_ascii=False)
         return json.dumps({"answers": out}, ensure_ascii=False)
 
 
@@ -235,7 +241,7 @@ def mock_cfg(mock, vision=False):
 # ① 纯函数单测
 # --------------------------------------------------------------------------- #
 def test_units():
-    print("\n[1/4] 基础函数")
+    print("\n[1/5] 基础函数")
 
     obj = llm.extract_json('说明文字\n```json\n{"a": 1,}\n```')
     check("llm.extract_json 容忍代码围栏与尾逗号", obj == {"a": 1}, str(obj))
@@ -308,7 +314,7 @@ def test_units():
 # ② 端到端：无讲义（纯文本作答）
 # --------------------------------------------------------------------------- #
 def test_pipeline_plain(root):
-    print("\n[2/4] 端到端：无讲义（纯文本两遍作答）")
+    print("\n[2/5] 端到端：无讲义（纯文本两遍作答）")
     qdir, n = make_fixture(root / "plain", with_docs=False)
     solver.DOC_CACHE = root / "plain" / "docs"      # 隔离缓存，别污染真实 cache/
     quiz.DOC_CACHE = solver.DOC_CACHE
@@ -354,7 +360,7 @@ def test_pipeline_plain(root):
 # ③ 端到端：有讲义 + 视觉摘要
 # --------------------------------------------------------------------------- #
 def test_pipeline_docs(root):
-    print("\n[3/4] 端到端：有讲义（视觉摘要 → 带页码引用 → high）")
+    print("\n[3/5] 端到端：有讲义（视觉摘要 → 带页码引用 → high）")
     qdir, n = make_fixture(root / "withdocs", with_docs=True)
     solver.DOC_CACHE = root / "withdocs" / "docs"
     quiz.DOC_CACHE = solver.DOC_CACHE
@@ -395,10 +401,90 @@ def test_pipeline_docs(root):
 
 
 # --------------------------------------------------------------------------- #
-# ④ 真实检索链路（可选）
+# ④ 容错：模型返回数组 / 复核阶段整体失败
+# --------------------------------------------------------------------------- #
+def test_resilience(root):
+    print("\n[4/5] 容错：模型返回数组 / 复核阶段整体失败")
+
+    # ① 顶层数组要被收敛成答案列表（原先直接 obj.get() 会 AttributeError）
+    batch = [{"no": 1, "type": "single_choice", "stem": "题干",
+              "options": [{"key": "A", "text": "甲"}, {"key": "B", "text": "乙"}]}]
+    data = {"chapter": {"num": "1", "title": "测试"}, "questions": batch}
+    real_json = llm.chat_json
+
+    def fake_json(*a, **kw):
+        return ([{"no": 1, "answer": ["A"], "confidence": "high",
+                  "cite": "通用学科知识"}],
+                {"calls": [{"latency_ms": 1, "usage": {}, "attempts": 1}], "repairs": 0})
+
+    llm.chat_json = fake_json
+    try:
+        got, calls = solver._call_batch({}, {"name": "mock"}, data, batch, "", "", 2)
+    finally:
+        llm.chat_json = real_json
+    check("顶层数组也能收敛成答案（原来会 AttributeError）",
+          len(got) == 1 and got[1]["answer"] == ["A"], str(got)[:120])
+    check("调用记录标注了解析类型", bool(calls) and calls[0].get("parsed") == "list",
+          str(calls)[:120])
+
+    # ② 第二遍整体崩掉 → 降级为单遍，仍要出答案
+    qdir, n = make_fixture(root / "degrade", with_docs=False)
+    solver.DOC_CACHE = root / "degrade" / "docs"
+    quiz.DOC_CACHE = solver.DOC_CACHE
+    mock = MockLLM().start()
+    real_run_pass = solver.run_pass
+
+    def boom(cfg, provider, d, batches, digest_text, evidence_by_no, pass_no, **kw):
+        if pass_no == 2:
+            raise RuntimeError("模拟复核崩溃")
+        return real_run_pass(cfg, provider, d, batches, digest_text, evidence_by_no,
+                             pass_no, **kw)
+
+    solver.run_pass = boom
+    try:
+        r = solver.solve_quiz(mock_cfg(mock), qdir,
+                              {"batch": 2, "pass2": True, "search": "off",
+                               "vision": "auto", "report": False, "force": True})
+    finally:
+        solver.run_pass = real_run_pass
+        mock.stop()
+
+    check("复核崩了不再整体失败", r.get("status") == "ok", str(r)[:200])
+    af = qdir / "answers.json"
+    ans = json.loads(af.read_text(encoding="utf-8"))["answers"] if af.exists() else []
+    check("降级后答案仍然写盘且齐全", len(ans) == n, f"{len(ans)}/{n}")
+    check("降级时置信度不超过 medium",
+          all(a["confidence"] != "high" for a in ans),
+          str([a["confidence"] for a in ans]))
+    run_info = json.loads((qdir / "solver_run.json").read_text(encoding="utf-8")) \
+        if (qdir / "solver_run.json").exists() else {}
+    check("solver_run 记录了降级原因", bool(run_info.get("pass2_degraded")))
+
+    # ③ 模型先吐数组、被要求重发后改对 → 自愈，不应降级
+    qdir2, n2 = make_fixture(root / "heal", with_docs=False)
+    solver.DOC_CACHE = root / "heal" / "docs"
+    quiz.DOC_CACHE = solver.DOC_CACHE
+    mock2 = MockLLM()
+    mock2.list_once = True
+    mock2.start()
+    try:
+        r2 = solver.solve_quiz(mock_cfg(mock2), qdir2,
+                               {"batch": 2, "pass2": True, "search": "off",
+                                "vision": "auto", "report": False, "force": True})
+    finally:
+        mock2.stop()
+    check("模型改对之后不降级、答案齐全",
+          r2.get("status") == "ok" and r2.get("answered") == n2, str(r2)[:200])
+    # 4 题 / 每批 2 题 = 两遍共 4 次请求；第一遍复核那批多一次"改错重发"才是 5 次
+    check("确实触发了「先给数组、被要求重发」的路径", len(mock2.calls) >= 5,
+          f"调用次数 {len(mock2.calls)}")
+
+
+# --------------------------------------------------------------------------- #
+# ⑤ 真实检索链路（可选）
 # --------------------------------------------------------------------------- #
 def test_network():
-    print("\n[4/4] 真实检索链路（--net）")
+    print("\n[5/5] 真实检索链路（--net）")
     cfg = {"search": {"engine": "auto", "max_results": 4}, "net": {"proxy": "auto"}}
     print(f"  代理：{netkit.detect_proxy() or '直连'}")
 
@@ -439,6 +525,7 @@ def main():
     test_units()
     test_pipeline_plain(root)
     test_pipeline_docs(root)
+    test_resilience(root)
     if args.net:
         test_network()
 
