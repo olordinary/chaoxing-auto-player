@@ -159,13 +159,26 @@ def active_name(cfg):
     return ""
 
 
+def _norm_base(url):
+    """比较接口地址时忽略结尾的斜杠和约定俗成的 /v1。
+
+    OpenAI 兼容服务两种写法都有人用（`https://api.deepseek.com` 与
+    `.../v1`），不归一化就会导致「改过预设 base_url 后，老配置认不出预设」，
+    预设里的 vision_models / json_mode 全部失效。
+    """
+    u = (url or "").strip().rstrip("/").lower()
+    if u.endswith("/v1"):
+        u = u[:-3].rstrip("/")
+    return u
+
+
 def preset_of(name, entry):
     """找到这个 provider 对应的预设（用于补默认值）。"""
     if name in PRESETS:
         return PRESETS[name]
-    base = (entry.get("base_url") or "").rstrip("/").lower()
+    base = _norm_base(entry.get("base_url"))
     for pname, p in PRESETS.items():
-        if p["base_url"].rstrip("/").lower() == base:
+        if _norm_base(p["base_url"]) == base:
             return p
     return {}
 
@@ -275,6 +288,7 @@ def chat(cfg, messages, provider=None, model=None, json_mode=None, temperature=N
     attempts = 0
     dropped_json_mode = False
     last = None
+    r = None
     while attempts <= retries:
         attempts += 1
         try:
@@ -283,11 +297,15 @@ def chat(cfg, messages, provider=None, model=None, json_mode=None, temperature=N
             break
         except netkit.NetError as e:
             msg = str(e)
-            # 有的服务不认 response_format，去掉再试
+            # 有的服务不认 response_format，去掉再试。
+            # 这一轮不算重试次数（否则 retries=0 时会直接跳出循环，
+            # r 从未被赋值 → UnboundLocalError）。
             if use_json and not dropped_json_mode and ("response_format" in msg or "400" in msg):
                 dropped_json_mode = True
                 use_json = False
                 payload.pop("response_format", None)
+                attempts -= 1
+                last = e
                 continue
             if "401" in msg or "403" in msg:
                 raise LLMError(f"{p['label']} 鉴权失败（{mask_key(p['api_key'])}）。"
@@ -299,8 +317,8 @@ def chat(cfg, messages, provider=None, model=None, json_mode=None, temperature=N
                 time.sleep(min(2 ** attempts, 15))
             continue
 
-    if last is not None and attempts > retries:
-        raise LLMError(f"{p['label']} 调用失败：{last}")
+    if r is None:
+        raise LLMError(f"{p['label']} 调用失败：{str(last)[:200] if last else '请求未成功'}")
 
     latency = int((time.time() - t0) * 1000)
     try:
@@ -419,8 +437,11 @@ def chat_json(cfg, messages, provider=None, model=None, max_repair=1, **kw):
 def test_provider(cfg, name=None):
     p = resolve_provider(cfg, name)
     t0 = time.time()
+    # 连通性测试不要开 JSON 模式：这类"只回复两个字"的探针没有 JSON 字样，
+    # 部分服务会直接 400；max_tokens 也要留够，否则 thinking 会把预算吃光。
     resp = chat(cfg, [{"role": "user", "content": "只回复两个字：可用"}],
-                provider=p["name"], max_tokens=32, temperature=0, retries=1)
+                provider=p["name"], max_tokens=256, temperature=0, retries=1,
+                json_mode=False)
     return {"provider": p["name"], "label": p["label"], "model": resp["model"],
             "reply": (resp["text"] or "").strip()[:40],
             "latency_ms": resp["latency_ms"], "wall_ms": int((time.time() - t0) * 1000),

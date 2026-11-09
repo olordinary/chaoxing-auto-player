@@ -89,8 +89,13 @@ def check_llm(cfg, out, do_call=True):
     out.item(True, f"已导入模型：{len(provs)} 个，当前默认 {active or '未设置'}")
     for name, raw in provs.items():
         mark = "*" if name == active else " "
-        vis = "读图" if raw.get("vision") else "纯文本"
-        out.info(f"  {mark} {name:<12}{raw.get('model', ''):<28}{vis}")
+        # 用解析后的结果，而不是配置里的原始值：
+        # 配置写 null 时能力是运行时现算的，看 raw 会误报成"纯文本"。
+        try:
+            vis = "读图" if llm.resolve_provider(cfg, name).get("vision") else "纯文本"
+        except llm.LLMError:
+            vis = "配置不全"
+        out.info(f"  {mark} {name:<16}{raw.get('model', ''):<28}{vis}")
 
     if not do_call:
         out.info("（--no-llm，跳过连通性测试）")
@@ -98,9 +103,7 @@ def check_llm(cfg, out, do_call=True):
     for name in provs:
         t0 = time.time()
         try:
-            p = llm.resolve_provider(cfg, name)
-            r = llm.chat(cfg, [{"role": "user", "content": "只回复两个字：可用"}],
-                         provider=name, max_tokens=16, temperature=0, retries=0)
+            r = llm.test_provider(cfg, name)      # 与 model test 共用一套探针，避免两处口径不一致
             out.item(True, f"{name} 可用（{r['latency_ms']}ms，模型 {r['model']}）")
         except Exception as e:
             msg = str(e).splitlines()[0][:90]
