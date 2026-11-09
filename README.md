@@ -609,6 +609,24 @@ runs/quiz-<run名>/
 不会。`quiz fetch` 与 `quiz auto` 全程只读：不点击「提交」「暂时保存」，不填写任何答题框。
 `quiz solve` 更是只读本地文件，连浏览器都不开。
 
+## 版本
+
+每个功能完整的阶段打一个 annotated tag，tag 与引入该版本的提交一起推送，
+用 `git tag -n1` 或 `git log --oneline --decorate` 就能看到整条迭代线。
+
+| 版本 | 主题 | 说明 |
+|---|---|---|
+| [v1.0.0](../../releases/tag/v1.0.0) | 视频连播工具 | 原生播放器连播 + 抽帧；抓题、反混淆、复习册。答案由外部写入 |
+| [v2.0.0](../../releases/tag/v2.0.0) | 自主生成参考答案 | 大模型 + 联网检索 + 两遍复核 + 规则化置信度；doctor / selftest；一轮审查整改 |
+
+**提交约定**（保持历史可读）：
+
+- 大版本：提交标题写 `feat!: vX.Y.Z <主题>`，同时打 annotated tag，tag 消息按
+  「新增 / 变更 / 修复 / 破坏性变更」分段
+- 日常改动：`fix(scope): …`、`feat(scope): …`、`docs: …`，不单独打 tag
+- 同一轮的多处修补可以合并为一个提交，但**不要在提交里混入无关改动**
+- `config.json`、`profile/`、`runs/`、`cache/`、`.workbuddy/` 永不入库
+
 ## License
 
 [MIT](LICENSE)
