@@ -45,7 +45,7 @@ os.environ.setdefault(
 
 TOOL_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = TOOL_DIR / "config.json"
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 
 # 注意：course 留空，由 `init` 命令从你自己的课程链接里解析后写入 config.json
 DEFAULT_CONFIG = {
@@ -1100,7 +1100,8 @@ def main():
     qa.add_argument("--docs-for", dest="docs_for",
                     help="同章有多套测验时人工指定依据，如 5.5=5.1,5.2")
     qa.add_argument("--dry-run", action="store_true", help="只打印关联计划，不抓取")
-    qa.add_argument("--force", action="store_true", help="忽略已有讲义与题目重抓")
+    qa.add_argument("--force", action="store_true",
+                    help="忽略已有讲义与题目重抓（注意：也会覆盖已有 answers.json）")
     qa.add_argument("--report-only", dest="report_only", action="store_true",
                     help="跳过抓取，只用现有 questions.json + answers.json 重出报告")
     qa.add_argument("--require-submitted", dest="require_submitted", action="store_true")
@@ -1159,6 +1160,8 @@ def main():
                     help="忽略缓存重新生成讲义摘要")
     qs.add_argument("--no-report", dest="no_report", action="store_true",
                     help="只出答案，不生成复习册")
+    qs.add_argument("--keep-raw", dest="keep_raw", action="store_true",
+                    help="额外保存模型原始输出到 solver_raw.json（排查解析问题用）")
     qs.add_argument("--dry-run", action="store_true", help="只打印计划与预计请求数")
     qs.set_defaults(func=cmd_quiz_entry)
 

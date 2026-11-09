@@ -37,7 +37,14 @@ PAGE_TTL = 3 * 24 * 3600
 
 
 class SearchError(RuntimeError):
-    pass
+    """检索异常。kind 用来区分「引擎不可用」和「没有相关资料」——
+    前者才该触发降级，后者是很正常的现象（题库不可能覆盖所有题）。
+    kind: blocked（被反爬/冷却）/ irrelevant（无相关结果）/ error（其它）
+    """
+
+    def __init__(self, msg, kind="error"):
+        super().__init__(msg)
+        self.kind = kind
 
 
 def conf(cfg):
@@ -610,7 +617,15 @@ def search(cfg, query, n=None, engine=None, proxy="auto", use_cache=True,
         break
 
     if not results:
-        raise SearchError("检索失败：" + ("；".join(errors[:4]) if errors else "所有引擎都返回空结果"))
+        joined = "；".join(errors)
+        msg = "检索失败：" + (joined[:400] if errors else "所有引擎都返回空结果")
+        if errors and all(("无结果" in e or "不相关" in e) for e in errors):
+            kind = "irrelevant"      # 引擎本身正常，只是没这道题的资料
+        elif any(k in joined for k in ("冷却", "安全验证", "反爬", "验证码")):
+            kind = "blocked"         # 被反爬拦了，换个引擎或等冷却
+        else:
+            kind = "error"
+        raise SearchError(msg, kind=kind)
 
     payload = {"query": query, "engine": used, "results": results, "cached": False,
                "raw_count": len(results), "errors": errors,

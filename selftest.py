@@ -285,6 +285,20 @@ def test_units():
     check("finalize 没联网却引检索 → 引用被改写",
           "通用" in r_nw["cite"], r_nw["cite"])
 
+    page_idx = {"12.1": {1, 2, 3}}
+    bad = {"answer": ["B"], "confidence": "high", "cite": "讲义 12.1 第99页（编的）"}
+    r_bad_page = solver.finalize(q3, bad, dict(bad), digest_used=True, web_used=False,
+                                 page_index=page_idx)
+    check("引用不存在的页码会被改写", "不存在" in r_bad_page["cite"],
+          r_bad_page["cite"])
+    check("引用不存在的页码拿不到 high", r_bad_page["confidence"] != "high",
+          r_bad_page["confidence"])
+    good = {"answer": ["B"], "confidence": "high", "cite": "讲义 12.1 第2页（真有的）"}
+    r_good_page = solver.finalize(q3, good, dict(good), digest_used=True, web_used=False,
+                                  page_index=page_idx)
+    check("引用真实页码仍然可以 high", r_good_page["confidence"] == "high",
+          r_good_page["confidence"])
+
     check("build_query 去掉问句套话",
           "主要作用机理" not in websearch.build_query("秋水仙素诱导染色体加倍的主要作用机理是:"),
           websearch.build_query("秋水仙素诱导染色体加倍的主要作用机理是:"))
@@ -478,6 +492,45 @@ def test_resilience(root):
     # 4 题 / 每批 2 题 = 两遍共 4 次请求；第一遍复核那批多一次"改错重发"才是 5 次
     check("确实触发了「先给数组、被要求重发」的路径", len(mock2.calls) >= 5,
           f"调用次数 {len(mock2.calls)}")
+
+    # ④ --limit 试跑不能覆盖已有的完整答案
+    qdir3, n3 = make_fixture(root / "limit", with_docs=False)
+    full = {"answers": [{"no": i, "answer": ["A"], "confidence": "medium",
+                         "verify": {}} for i in range(1, n3 + 1)]}
+    (qdir3 / "answers.json").write_text(json.dumps(full, ensure_ascii=False),
+                                        encoding="utf-8")
+    r3 = solver.solve_quiz({}, qdir3, {"limit": 2, "force": True, "search": "off"})
+    kept = json.loads((qdir3 / "answers.json").read_text(encoding="utf-8"))["answers"]
+    check("--limit 不会覆盖已有的完整答案",
+          r3.get("status") == "limit_protected" and len(kept) == n3,
+          f"{r3.get('status')} / 剩 {len(kept)} 条")
+
+    # ⑤ 检索：连续"没相关资料"不该关闭检索；连续"引擎不可用"才停
+    targets = [({"no": i, "stem": "秋水仙素诱导染色体加倍的作用机理"},
+                "低置信") for i in range(1, 5)]
+    real_search = websearch.search
+
+    def fake_irrelevant(cfg, q, **kw):
+        raise websearch.SearchError("检索失败：360: 无结果", kind="irrelevant")
+
+    websearch.search = fake_irrelevant
+    try:
+        ev, audit, ok = solver.do_search({}, [], targets, 4, "", log=lambda *a: None)
+    finally:
+        websearch.search = real_search
+    check("连续「没相关资料」不会关闭整段检索", ok is True and len(audit) == 4,
+          f"ok={ok} audit={len(audit)}")
+
+    def fake_blocked(cfg, q, **kw):
+        raise websearch.SearchError("检索失败：baidu: 返回了安全验证页", kind="blocked")
+
+    websearch.search = fake_blocked
+    try:
+        ev, audit, ok = solver.do_search({}, [], targets, 4, "", log=lambda *a: None)
+    finally:
+        websearch.search = real_search
+    check("连续「引擎不可用」才停手", ok is False and len(audit) == 3,
+          f"ok={ok} audit={len(audit)}")
 
 
 # --------------------------------------------------------------------------- #
