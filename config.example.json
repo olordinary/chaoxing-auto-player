@@ -1,5 +1,9 @@
 {
-  "_说明": "把这个文件复制成 config.json 后按需修改；也可以直接运行 python chaoxing_player.py init 自动生成。",
+  "_说明": [
+    "把这个文件复制成 config.json 后按需修改；也可以直接运行 python chaoxing_player.py init 自动生成。",
+    "llm 段不用手写：用 python chaoxing_player.py model add 交互式导入（密钥会写进 config.json，该文件已被 .gitignore 忽略）。",
+    "search 段不配也能用：默认走免密钥的 360 / 搜狗 / 百度 / 必应；想更稳再填付费检索的密钥。"
+  ],
   "cdp_port": 9225,
   "edge": "",
   "profile_dir": "",
@@ -10,5 +14,25 @@
     "cpi": "",
     "enc": "",
     "entry_chapter": ""
+  },
+  "quiz_policy": {
+    "require_submitted": false,
+    "watermark": "参考答案 · 仅供预习与复习，考试以线下为准"
+  },
+  "llm": {
+    "active": "",
+    "providers": {}
+  },
+  "search": {
+    "engine": "auto",
+    "max_results": 5,
+    "fetch_pages": 0,
+    "bocha_api_key": "",
+    "tavily_api_key": "",
+    "serper_api_key": "",
+    "searx_url": ""
+  },
+  "net": {
+    "proxy": "auto"
   }
 }

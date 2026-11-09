@@ -28,11 +28,20 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-# 本地 CDP 不能被系统 http_proxy 拦掉
+# 本地 CDP 不能被系统 http_proxy 拦掉。
+# 但调大模型 / 联网检索又必须走代理，所以先备份再清理，备份值交给 netkit 用。
+_SAVED_PROXY = {k: os.environ[k] for k in
+                ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                 "ALL_PROXY", "all_proxy") if os.environ.get(k)}
 for _k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"):
     os.environ.pop(_k, None)
 os.environ["NO_PROXY"] = "127.0.0.1,localhost"
 os.environ["no_proxy"] = "127.0.0.1,localhost"
+os.environ.setdefault(
+    "CXP_HTTP_PROXY",
+    _SAVED_PROXY.get("https_proxy") or _SAVED_PROXY.get("HTTPS_PROXY")
+    or _SAVED_PROXY.get("http_proxy") or _SAVED_PROXY.get("HTTP_PROXY")
+    or _SAVED_PROXY.get("all_proxy") or _SAVED_PROXY.get("ALL_PROXY") or "")
 
 TOOL_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = TOOL_DIR / "config.json"
@@ -49,6 +58,12 @@ DEFAULT_CONFIG = {
         "require_submitted": False,
         "watermark": "参考答案 · 仅供预习与复习，考试以线下为准",
     },
+    # 大模型配置：用 `model add` 写入，密钥只存本地（config.json 已被 .gitignore 忽略）
+    "llm": {"active": "", "providers": {}},
+    # 联网检索：auto = 免密钥引擎优先，配了 key 的引擎优先用
+    "search": {"engine": "auto", "max_results": 5, "fetch_pages": 0},
+    # 出网方式：auto 自动探测（环境变量 → 系统代理 → 本地常见端口）
+    "net": {"proxy": "auto"},
 }
 
 EDGE_CANDIDATES = [
@@ -969,6 +984,18 @@ def cmd_quiz_entry(cfg, args):
     return quiz.cmd_quiz(cfg, args, sys.modules[__name__])
 
 
+def cmd_model(cfg, args):
+    """大模型配置入口，转发到 llm 模块。"""
+    import llm
+    return llm.cmd_model(cfg, args)
+
+
+def cmd_doctor(cfg, args):
+    """体检入口，转发到 doctor 模块。"""
+    import doctor
+    return doctor.cmd_doctor(cfg, args)
+
+
 # --------------------------------------------------------------------------- #
 def main():
     ap = argparse.ArgumentParser(description="超星 / 学习通 章节视频连播与测验整理工具")
@@ -1056,8 +1083,9 @@ def main():
 
     qa = qzsub.add_parser(
         "auto",
-        help="一键：抓讲义 → 抓题 → 打包作答载荷 →（有答案时）出复习册",
-        description=("一键跑完一套测验的完整流程。\n"
+        help="一键：抓讲义 → 抓题 → 自动作答 → 出复习册",
+        description=("一键跑完一套测验的完整流程：抓讲义 → 抓题 → 打包作答载荷 →\n"
+                     "调大模型自动作答（已导入模型时）→ 出复习册。\n"
                      "注意与 `play --all` 的区别：\n"
                      "  play --all  = 目录里全部播放节点（视频为主），逐个播放；\n"
                      "  quiz auto --all = 只处理测验节点，抓讲义和题目，不播放任何视频。"),
@@ -1077,9 +1105,107 @@ def main():
                     help="跳过抓取，只用现有 questions.json + answers.json 重出报告")
     qa.add_argument("--require-submitted", dest="require_submitted", action="store_true")
     qa.add_argument("--no-require-submitted", dest="require_submitted", action="store_false")
+
+    # ---- 自动作答（可在 auto 里一并跑完，也可单独 `quiz solve`）----
+    qa.add_argument("--solve", dest="solve", action="store_true",
+                    help="抓完题后自动生成参考答案（默认：已导入模型时自动开启）")
+    qa.add_argument("--no-solve", dest="no_solve", action="store_true",
+                    help="只抓题，不自动作答")
+    qa.add_argument("--model", help="本次作答使用哪个已导入的模型配置")
+    qa.add_argument("--no-pass2", dest="no_pass2", action="store_true",
+                    help="只做一遍作答（更快，但置信度上限为中）")
+    qa.add_argument("--search", choices=["auto", "on", "off"], default="auto",
+                    help="低置信题是否联网检索（默认 auto）")
+    qa.add_argument("--limit", type=int, default=0,
+                    help="每套只作答前 N 题（试跑用）")
     qa.set_defaults(func=cmd_quiz_entry, require_submitted=None, from_=None, to=None,
                      all=False, index=None, chapters=None, dry_run=False,
-                     force=False, report_only=False, docs_for=None)
+                     force=False, report_only=False, docs_for=None,
+                     solve=False, no_solve=False, no_pass2=False, limit=0)
+
+    qs = qzsub.add_parser(
+        "solve",
+        help="用大模型 + 讲义 + 联网检索，自动生成参考答案",
+        description=("对已抓到的 questions.json 自动作答。全程只读本地文件，"
+                     "不需要开浏览器。\n"
+                     "流程：讲义视觉摘要 → 分批判卷 → 低置信题联网检索 → 独立复核 → 定稿。\n"
+                     "产物：answers.json / solver_run.json / solver_trace.md（+ 复习册）。"),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    qs.add_argument("--run", help="run 目录，如 ch12（也接受 JSON 批次名或题目目录）")
+    qs.add_argument("--quiz-dir", dest="quiz_dir", help="直接指定某套题的目录")
+    qs.add_argument("--chapter", dest="chapters", help="章节号，如 12")
+    qs.add_argument("--chapters", help="多个章节号，逗号分隔，如 12,7")
+    qs.add_argument("--all", action="store_true", help="runs 下所有已抓取的测验")
+    qs.add_argument("--model", help="使用哪个已导入的模型配置（默认取 llm.active）")
+    qs.add_argument("--digest-model", dest="digest_model",
+                    help="专门用来读讲义页图片的视觉模型（主模型不支持读图时用）")
+    qs.add_argument("--no-pass2", dest="no_pass2", action="store_true",
+                    help="跳过第二遍独立复核")
+    qs.add_argument("--search", choices=["auto", "on", "off"], default="auto",
+                    help="联网检索策略（默认 auto：只查低置信题）")
+    qs.add_argument("--vision", choices=["auto", "on", "off"], default="auto",
+                    help="是否用视觉模型读讲义页（默认 auto）")
+    qs.add_argument("--batch", type=int, default=5, help="每批几题（默认 5）")
+    qs.add_argument("--limit", type=int, default=0, help="每套只作答前 N 题（试跑用）")
+    qs.add_argument("--search-limit", dest="search_limit", type=int, default=8,
+                    help="每套最多检索几次（默认 8）")
+    qs.add_argument("--fetch-pages", dest="fetch_pages", type=int, default=0,
+                    help="检索摘要太短时，抓前 N 条网页正文补充（默认 0）")
+    qs.add_argument("--max-doc-chars", dest="max_doc_chars", type=int, default=9000,
+                    help="讲义摘要注入提示词的字数上限（默认 9000）")
+    qs.add_argument("--workers", type=int, default=1, help="并发批次数（默认 1，防止触发限流）")
+    qs.add_argument("--force", action="store_true", help="覆盖已存在的 answers.json")
+    qs.add_argument("--force-digest", dest="force_digest", action="store_true",
+                    help="忽略缓存重新生成讲义摘要")
+    qs.add_argument("--no-report", dest="no_report", action="store_true",
+                    help="只出答案，不生成复习册")
+    qs.add_argument("--dry-run", action="store_true", help="只打印计划与预计请求数")
+    qs.set_defaults(func=cmd_quiz_entry)
+
+    # ---- 大模型配置 ----
+    md = sub.add_parser("model", help="导入 / 选择要调用的大模型")
+    mdsub = md.add_subparsers(dest="model_cmd", required=True)
+
+    ml = mdsub.add_parser("list", help="看已导入的模型 + 内置预设")
+    ml.set_defaults(func=cmd_model)
+
+    ma = mdsub.add_parser("add", help="导入一个模型（不带参数则交互式引导）")
+    ma.add_argument("--preset", help="用内置预设，如 deepseek / dashscope / ollama")
+    ma.add_argument("--name", help="配置名（命令行里用它指定）")
+    ma.add_argument("--base-url", dest="base_url", help="OpenAI 兼容接口地址，如 https://xxx/v1")
+    ma.add_argument("--api-key", dest="api_key", help="密钥（会写进 config.json）")
+    ma.add_argument("--api-key-env", dest="api_key_env",
+                    help="只存环境变量名，密钥本身放系统环境变量里（更安全）")
+    ma.add_argument("--model", help="模型名（官方文档里的 model 值，如 deepseek-flash）")
+    ma.add_argument("--label", help="显示名称")
+    ma.add_argument("--set-active", dest="set_active", action="store_true",
+                    help="同时设为默认模型")
+    ma.add_argument("--no-test", dest="no_test", action="store_true", help="导入后不测试连通性")
+    ma.set_defaults(func=cmd_model)
+
+    mu = mdsub.add_parser("use", help="切换默认模型")
+    mu.add_argument("name")
+    mu.set_defaults(func=cmd_model)
+
+    mt = mdsub.add_parser("test", help="测试连通性")
+    mt.add_argument("name", nargs="?")
+    mt.set_defaults(func=cmd_model)
+
+    mw = mdsub.add_parser("show", help="查看某个模型的完整配置（密钥打码）")
+    mw.add_argument("name", nargs="?")
+    mw.set_defaults(func=cmd_model)
+
+    mr = mdsub.add_parser("rm", help="删除一个模型配置")
+    mr.add_argument("name")
+    mr.set_defaults(func=cmd_model)
+
+    # ---- 体检 ----
+    dr = sub.add_parser("doctor", help="体检：环境 / 模型 / 检索 / 题库逐项检查")
+    dr.add_argument("--no-llm", dest="no_llm", action="store_true",
+                    help="不调模型（省钱，只查配置）")
+    dr.add_argument("--no-net", dest="no_net", action="store_true",
+                    help="不测检索链路")
+    dr.set_defaults(func=cmd_doctor)
 
     args = ap.parse_args()
     cfg = load_config()

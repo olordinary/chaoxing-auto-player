@@ -443,6 +443,9 @@ def cmd_quiz(cfg, args, cp):
         return quiz_docs(cfg, args, cp)
     if sub == "auto":
         return quiz_auto(cfg, args, cp)
+    if sub == "solve":
+        import solver
+        return solver.cmd_solve(cfg, args)
     return 1
 
 
@@ -735,6 +738,19 @@ def quiz_docs(cfg, args, cp):
 # --------------------------------------------------------------------------- #
 # 一键流水线：scan → docs → fetch → pack → report
 # --------------------------------------------------------------------------- #
+def should_solve(cfg, args):
+    """决定了 auto 是否顺手把答案也生成出来。
+
+    默认策略：只要导入过模型就自动作答（这才是「一条命令跑到底」），
+    没导入就只抓到「待作答」为止，并提示怎么补。
+    """
+    if getattr(args, "no_solve", False):
+        return False
+    if getattr(args, "solve", False):
+        return True
+    return bool((cfg.get("llm") or {}).get("providers"))
+
+
 def chapter_key(num):
     """'5' -> 'ch05'，保证目录排序稳定。"""
     try:
@@ -930,7 +946,7 @@ def report_one(qf, watermark=None):
 
 
 def quiz_auto(cfg, args, cp):
-    """一键：抓讲义 → 抓题 → 打包作答载荷 →（有答案时）出复习册。
+    """一键：抓讲义 → 抓题 → 打包作答载荷 → 自动作答 → 出复习册。
 
     与 play --all 的区别：play 的 --all 是整个目录的播放节点；
     这里的 --all 只处理测验节点，且不会播放任何视频。
@@ -1023,6 +1039,10 @@ def quiz_auto(cfg, args, cp):
 
         # ---- 执行 ----
         policy_required = args.require_submitted
+        want_solve = should_solve(cfg, args)
+        if not want_solve and not getattr(args, "no_solve", False):
+            print("提示：还没有导入大模型，本次只抓题不自动作答。")
+            print("      导入后重跑即可一路生成参考答案：python chaoxing_player.py model add\n")
         summary = []
         for j in jobs:
             ch, q, deps = j["chapter"], j["quiz"], j["deps"]
@@ -1074,6 +1094,21 @@ def quiz_auto(cfg, args, cp):
                     save_flow(rdir, flow)
                     print(f"   已生成作答载荷 {payload.name}（{rec['count']} 题）")
 
+                    # ④ 自动作答（已有 answers.json 就尊重它，不覆盖）
+                    if want_solve and not (qdir / "answers.json").exists():
+                        import solver
+                        print("   自动作答（大模型 + 讲义 + 联网检索）...")
+                        rec["state"] = "solving"
+                        save_flow(rdir, flow)
+                        r = solver.solve_quiz(cfg, qdir,
+                                              solver.make_opts(args, report=False))
+                        rec["solve"] = {k: r.get(k) for k in
+                                        ("status", "answered", "high", "medium",
+                                         "low", "seconds")}
+                        rec["state"] = "solved" if r.get("status") == "ok" else str(
+                            r.get("status"))
+                        save_flow(rdir, flow)
+
                 # ④ 出报告
                 qf = qdir / "questions.json"
                 if qf.exists():
@@ -1099,6 +1134,14 @@ def quiz_auto(cfg, args, cp):
         pending = [n for n, s in summary if s in ("packed", "answers_pending")]
         if pending:
             print(f"\n待作答：{', '.join(pending)}")
-            print("  这些套的 solve_payload.md 已就绪，作答后跑 "
-                  "`quiz auto --chapters <编号> --report-only` 出复习册")
+            if want_solve:
+                print("  自动作答未完成（看上面的报错）。修好后可单独重跑：")
+                print("  python chaoxing_player.py quiz solve --chapters "
+                      + pending[0])
+            else:
+                print("  这些套的 solve_payload.md 已就绪。两种收尾方式：")
+                print("  · 自动：python chaoxing_player.py model add  然后 "
+                      "quiz solve --chapters " + pending[0])
+                print("  · 手动：自己写 answers.json，再 "
+                      "quiz auto --chapters " + pending[0] + " --report-only")
     return 0
